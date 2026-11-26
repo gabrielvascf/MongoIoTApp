@@ -11,8 +11,9 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use mongodb::{
-    Client, Collection, IndexModel,
+    Client, Collection, Database,
     bson::{Bson, DateTime, Document, doc},
+    options::{TimeseriesGranularity, TimeseriesOptions},
 };
 use serde::{Deserialize, Serialize};
 use std::{env, net::SocketAddr, time::Duration};
@@ -22,9 +23,11 @@ use tokio::{
 };
 
 const MAX_READINGS_PER_DEVICE: i64 = 30 * 24 * 60;
+const MAX_READINGS_PER_REQUEST: usize = 6000;
 const WRITE_BATCH_WINDOW: Duration = Duration::from_millis(10);
 const MAX_DOCUMENTS_PER_WRITE: usize = 500;
 const WRITE_QUEUE_CAPACITY: usize = 128;
+const READINGS_COLLECTION: &str = "readings_ts";
 
 type WriteResult = Result<Vec<String>, ()>;
 
@@ -122,15 +125,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = Client::with_uri_str(&mongo_uri).await?;
     let database = client.database(&database_name);
-    let readings = database.collection::<Document>("readings");
-    // Este índice acelera consultas das leituras de um dispositivo por horário.
-    readings
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "device_id": 1, "timestamp": -1 })
-                .build(),
-        )
-        .await?;
+    ensure_readings_timeseries_collection(&database).await?;
+    let readings = database.collection::<Document>(READINGS_COLLECTION);
 
     let (write_queue, write_receiver) = mpsc::channel(WRITE_QUEUE_CAPACITY);
     tokio::spawn(run_write_worker(readings.clone(), write_receiver));
@@ -155,6 +151,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn ensure_readings_timeseries_collection(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut collections = database.list_collections().await?;
+    while let Some(collection) = collections.try_next().await? {
+        if collection.name != READINGS_COLLECTION {
+            continue;
+        }
+
+        let is_expected_timeseries =
+            collection
+                .options
+                .timeseries
+                .as_ref()
+                .is_some_and(|options| {
+                    options.time_field == "timestamp"
+                        && options.meta_field.as_deref() == Some("device_id")
+                        && options.granularity.as_ref() == Some(&TimeseriesGranularity::Minutes)
+                });
+        if is_expected_timeseries {
+            return Ok(());
+        }
+
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "MongoDB collection '{READINGS_COLLECTION}' exists but is not configured as the expected time-series collection"
+            ),
+        )
+        .into());
+    }
+
+    database
+        .create_collection(READINGS_COLLECTION)
+        .timeseries(
+            TimeseriesOptions::builder()
+                .time_field("timestamp")
+                .meta_field(Some("device_id".to_owned()))
+                .granularity(TimeseriesGranularity::Minutes)
+                .build(),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn health(State(state): State<AppState>) -> Response {
     // Confirma que o processo consegue alcançar o MongoDB, não apenas que a porta HTTP está aberta.
     match state.database.run_command(doc! { "ping": 1 }).await {
@@ -171,18 +212,23 @@ async fn health(State(state): State<AppState>) -> Response {
 }
 
 async fn list_devices(State(state): State<AppState>) -> Result<Json<Vec<String>>, ApiError> {
-    let mut devices = state
+    let mut cursor = state
         .readings
-        .distinct("device_id", doc! {})
+        .aggregate(vec![
+            doc! { "$group": { "_id": "$device_id" } },
+            doc! { "$sort": { "_id": 1 } },
+        ])
         .await
-        .map_err(ApiError::Database)?
-        .into_iter()
-        .map(|value| match value {
-            Bson::String(device_id) => Ok(device_id),
-            _ => Err(ApiError::InvalidStoredData),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    devices.sort();
+        .map_err(ApiError::Database)?;
+    let mut devices = Vec::new();
+    while let Some(document) = cursor.try_next().await.map_err(ApiError::Database)? {
+        devices.push(
+            document
+                .get_str("_id")
+                .map_err(|_| ApiError::InvalidStoredData)?
+                .to_owned(),
+        );
+    }
     Ok(Json(devices))
 }
 
@@ -251,9 +297,9 @@ async fn create_reading_batch(
             "readings must contain at least one item",
         ));
     }
-    if batch.readings.len() > MAX_DOCUMENTS_PER_WRITE {
+    if batch.readings.len() > MAX_READINGS_PER_REQUEST {
         return Err(ApiError::BadRequest(
-            "readings cannot contain more than 1000 items",
+            "readings cannot contain more than 6000 items",
         ));
     }
 

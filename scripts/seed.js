@@ -1,5 +1,5 @@
 const DEVICE_COUNT = 100;
-const DAYS = 30;
+const DAYS = 30*6;
 const MINUTES_PER_DAY = 24 * 60;
 const MINUTE_MS = 60 * 1000;
 const READINGS_PER_DEVICE = DAYS * MINUTES_PER_DAY;
@@ -19,8 +19,30 @@ const sensorProfiles = [
   },
 ];
 
-const readings = db.getCollection('readings');
-readings.createIndex({ device_id: 1, timestamp: -1 });
+const READINGS_COLLECTION = 'readings_ts';
+const collectionInfo = db.getCollectionInfos({ name: READINGS_COLLECTION })[0];
+if (!collectionInfo) {
+  db.createCollection(READINGS_COLLECTION, {
+    timeseries: {
+      timeField: 'timestamp',
+      metaField: 'device_id',
+      granularity: 'minutes',
+    },
+  });
+} else {
+  const timeseries = collectionInfo.options.timeseries;
+  if (
+    !timeseries ||
+    timeseries.timeField !== 'timestamp' ||
+    timeseries.metaField !== 'device_id' ||
+    timeseries.granularity !== 'minutes'
+  ) {
+    throw new Error(
+      `${READINGS_COLLECTION} exists but is not the expected time-series collection`,
+    );
+  }
+}
+const readings = db.getCollection(READINGS_COLLECTION);
 
 const endTime = Date.now();
 const startTime = endTime - DAYS * 24 * 60 * MINUTE_MS;
