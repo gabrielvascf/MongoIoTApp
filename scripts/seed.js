@@ -7,13 +7,16 @@ const EXPECTED_READINGS = DEVICE_COUNT * READINGS_PER_DEVICE;
 const BATCH_SIZE = 1000;
 
 const sensorProfiles = [
-  ['humidity_percent'],
-  ['soil_ph'],
-  ['temperature_c'],
-  ['humidity_percent', 'soil_ph'],
-  ['humidity_percent', 'temperature_c'],
-  ['soil_ph', 'temperature_c'],
-  ['humidity_percent', 'soil_ph', 'temperature_c'],
+  { suffix: 'H', sensors: ['humidity_percent'] },
+  { suffix: 'P', sensors: ['soil_ph'] },
+  { suffix: 'T', sensors: ['temperature_c'] },
+  { suffix: 'H-P', sensors: ['humidity_percent', 'soil_ph'] },
+  { suffix: 'H-T', sensors: ['humidity_percent', 'temperature_c'] },
+  { suffix: 'P-T', sensors: ['soil_ph', 'temperature_c'] },
+  {
+    suffix: 'H-P-T',
+    sensors: ['humidity_percent', 'soil_ph', 'temperature_c'],
+  },
 ];
 
 const readings = db.getCollection('readings');
@@ -44,8 +47,12 @@ print(
 );
 
 for (let deviceIndex = 0; deviceIndex < DEVICE_COUNT; deviceIndex += 1) {
-  const deviceId = `seed-device-${String(deviceIndex + 1).padStart(3, '0')}`;
   const profile = sensorProfiles[deviceIndex % sensorProfiles.length];
+  const deviceId = `seed-device-${String(deviceIndex + 1).padStart(3, '0')} (${profile.suffix})`;
+  const devicePhase = deviceIndex * 0.13;
+  const humidityAmplitude = 7 + (deviceIndex % 5);
+  const soilPhAmplitude = 0.2 + (deviceIndex % 4) * 0.05;
+  const temperatureAmplitude = 5 + (deviceIndex % 5) * 0.8;
 
   for (let minuteIndex = 0; minuteIndex < READINGS_PER_DEVICE; minuteIndex += 1) {
     const minuteOfDay = minuteIndex % MINUTES_PER_DAY;
@@ -56,28 +63,28 @@ for (let deviceIndex = 0; deviceIndex < DEVICE_COUNT; deviceIndex += 1) {
       timestamp,
     };
 
-    if (profile.includes('humidity_percent')) {
+    if (profile.sensors.includes('humidity_percent')) {
       reading.humidity_percent = clamp(
         43 +
           (deviceIndex % 8) * 3 +
-          9 * Math.sin(dailyPhase + deviceIndex * 0.13) +
-          2.5 * Math.sin((minuteIndex + deviceIndex * 7) * 0.07),
+          humidityAmplitude * Math.sin(dailyPhase + devicePhase),
         0,
         100,
       );
     }
 
-    if (profile.includes('soil_ph')) {
+    if (profile.sensors.includes('soil_ph')) {
       reading.soil_ph =
-        4.8 + (deviceIndex % 14) * 0.25 + 0.18 * Math.sin(minuteIndex * 0.008 + deviceIndex);
+        4.8 +
+        (deviceIndex % 14) * 0.25 +
+        soilPhAmplitude * Math.sin(dailyPhase + devicePhase + Math.PI / 3);
     }
 
-    if (profile.includes('temperature_c')) {
+    if (profile.sensors.includes('temperature_c')) {
       reading.temperature_c =
         13 +
         (deviceIndex % 18) * 0.8 +
-        7 * Math.sin(dailyPhase) +
-        1.2 * Math.sin((minuteIndex + deviceIndex * 3) * 0.05);
+        temperatureAmplitude * Math.sin(dailyPhase + devicePhase + Math.PI / 2);
     }
 
     operations.push({ insertOne: { document: reading } });
