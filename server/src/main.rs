@@ -15,31 +15,13 @@ use mongodb::{
     bson::{Bson, DateTime, Document, doc},
 };
 use serde::{Deserialize, Serialize};
-use std::{env, net::SocketAddr, time::Duration};
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::{Instant, sleep_until},
-};
-
-const MAX_READINGS_PER_DEVICE: i64 = 30 * 24 * 60;
-const WRITE_BATCH_WINDOW: Duration = Duration::from_millis(10);
-const MAX_DOCUMENTS_PER_WRITE: usize = 500;
-const WRITE_QUEUE_CAPACITY: usize = 128;
-
-type WriteResult = Result<Vec<String>, ()>;
-
-struct PendingWrite {
-    documents: Vec<Document>,
-    response: oneshot::Sender<WriteResult>,
-    enqueued_at: Instant,
-}
+use std::{env, net::SocketAddr};
 
 #[derive(Clone)]
 struct AppState {
     // Axum compartilha este estado entre as requisições concorrentes.
     readings: Collection<Document>,
     database: mongodb::Database,
-    write_queue: mpsc::Sender<PendingWrite>,
 }
 
 #[derive(Deserialize)]
@@ -132,14 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let (write_queue, write_receiver) = mpsc::channel(WRITE_QUEUE_CAPACITY);
-    tokio::spawn(run_write_worker(readings.clone(), write_receiver));
-
-    let state = AppState {
-        readings,
-        database,
-        write_queue,
-    };
+    let state = AppState { readings, database };
     // Cada rota recebe uma cópia leve do estado compartilhado.
     let app = Router::new()
         .route("/health", get(health))
@@ -210,7 +185,7 @@ async fn list_readings(
         .readings
         .find(filter)
         .sort(doc! { "timestamp": -1 })
-        .limit(MAX_READINGS_PER_DEVICE)
+        .limit(5000)
         .await
         .map_err(ApiError::Database)?;
     let mut readings = Vec::new();
@@ -229,8 +204,16 @@ async fn create_reading(
     // O endpoint unitário é mantido para clientes que enviam uma leitura por chamada.
     let device_id = validate_device_id(&reading.device_id)?;
     let document = reading_document(device_id, reading.measurement)?;
-    let mut ids = enqueue_write(&state, vec![document]).await?;
-    let id = ids.pop().ok_or(ApiError::InvalidStoredData)?;
+    let result = state
+        .readings
+        .insert_one(document)
+        .await
+        .map_err(ApiError::Database)?;
+    let id = result
+        .inserted_id
+        .as_object_id()
+        .expect("MongoDB generates an ObjectId for inserted readings")
+        .to_hex();
 
     Ok((
         StatusCode::CREATED,
@@ -251,11 +234,6 @@ async fn create_reading_batch(
             "readings must contain at least one item",
         ));
     }
-    if batch.readings.len() > MAX_DOCUMENTS_PER_WRITE {
-        return Err(ApiError::BadRequest(
-            "readings cannot contain more than 1000 items",
-        ));
-    }
 
     // Valida todo o lote antes de enviar os documentos ao MongoDB.
     let documents = batch
@@ -263,7 +241,23 @@ async fn create_reading_batch(
         .into_iter()
         .map(|reading| reading_document(device_id, reading))
         .collect::<Result<Vec<_>, _>>()?;
-    let ids = enqueue_write(&state, documents).await?;
+    let result = state
+        .readings
+        .insert_many(documents)
+        .await
+        .map_err(ApiError::Database)?;
+    // MongoDB devolve IDs associados aos índices de entrada; ordená-los preserva a ordem do lote.
+    let mut inserted_ids = result.inserted_ids.into_iter().collect::<Vec<_>>();
+    inserted_ids.sort_by_key(|(index, _)| *index);
+    let ids = inserted_ids
+        .into_iter()
+        .map(|(_, id)| id)
+        .map(|id| {
+            id.as_object_id()
+                .expect("MongoDB generates an ObjectId for inserted readings")
+                .to_hex()
+        })
+        .collect::<Vec<_>>();
 
     Ok((
         StatusCode::CREATED,
@@ -273,213 +267,6 @@ async fn create_reading_batch(
             ids,
         }),
     ))
-}
-
-async fn enqueue_write(
-    state: &AppState,
-    documents: Vec<Document>,
-) -> Result<Vec<String>, ApiError> {
-    let (response, result) = oneshot::channel();
-    let enqueued_at = Instant::now();
-    state
-        .write_queue
-        .send(PendingWrite {
-            documents,
-            response,
-            enqueued_at,
-        })
-        .await
-        .map_err(|_| ApiError::WriteQueueUnavailable)?;
-
-    result
-        .await
-        .map_err(|_| ApiError::WriteQueueUnavailable)?
-        .map_err(|()| ApiError::BatchWriteFailed)
-}
-
-async fn run_write_worker(
-    readings: Collection<Document>,
-    mut receiver: mpsc::Receiver<PendingWrite>,
-) {
-    let mut overflow = None;
-    let mut metrics_window_started = Instant::now();
-    let mut metric_batches = 0;
-    let mut metric_requests = 0;
-    let mut metric_documents = 0;
-    let mut total_queue_wait = Duration::ZERO;
-    let mut max_queue_wait = Duration::ZERO;
-    let mut total_collect_time = Duration::ZERO;
-    let mut total_insert_many_time = Duration::ZERO;
-    let mut max_insert_many_time = Duration::ZERO;
-
-    loop {
-        let first = match overflow.take() {
-            Some(request) => request,
-            None => match receiver.recv().await {
-                Some(request) => request,
-                None => return,
-            },
-        };
-        let batch = collect_write_batch(&mut receiver, first).await;
-        overflow = batch.overflow;
-        let queue_wait_total = batch.queue_wait_total;
-        let queue_wait_max = batch.queue_wait_max;
-        let collect_time = batch.collect_time;
-        let documents = batch.documents;
-        let responses = batch.responses;
-        let request_count = responses.len();
-        let document_count = documents.len();
-
-        let insert_started = Instant::now();
-        let result = readings.insert_many(documents).await;
-        let insert_many_time = insert_started.elapsed();
-
-        metric_batches += 1;
-        metric_requests += request_count;
-        metric_documents += document_count;
-        total_queue_wait += queue_wait_total;
-        max_queue_wait = max_queue_wait.max(queue_wait_max);
-        total_collect_time += collect_time;
-        total_insert_many_time += insert_many_time;
-        max_insert_many_time = max_insert_many_time.max(insert_many_time);
-
-        let metrics_window = metrics_window_started.elapsed();
-        if metrics_window >= Duration::from_secs(1) {
-            eprintln!(
-                "[mongo-write] window_ms={} batches={} requests={} documents={} \
-                 queue_wait_avg_ms={:.2} queue_wait_max_ms={:.2} \
-                 collect_avg_ms={:.2} insert_many_avg_ms={:.2} insert_many_max_ms={:.2}",
-                metrics_window.as_millis(),
-                metric_batches,
-                metric_requests,
-                metric_documents,
-                total_queue_wait.as_secs_f64() * 1000.0 / metric_requests as f64,
-                max_queue_wait.as_secs_f64() * 1000.0,
-                total_collect_time.as_secs_f64() * 1000.0 / metric_batches as f64,
-                total_insert_many_time.as_secs_f64() * 1000.0 / metric_batches as f64,
-                max_insert_many_time.as_secs_f64() * 1000.0,
-            );
-            metrics_window_started = Instant::now();
-            metric_batches = 0;
-            metric_requests = 0;
-            metric_documents = 0;
-            total_queue_wait = Duration::ZERO;
-            max_queue_wait = Duration::ZERO;
-            total_collect_time = Duration::ZERO;
-            total_insert_many_time = Duration::ZERO;
-            max_insert_many_time = Duration::ZERO;
-        }
-
-        match result {
-            Ok(result) => {
-                // MongoDB indexes IDs by input position; keep each request's response ordered.
-                let mut inserted_ids = result.inserted_ids.into_iter().collect::<Vec<_>>();
-                inserted_ids.sort_by_key(|(index, _)| *index);
-                let ids = inserted_ids
-                    .into_iter()
-                    .map(|(_, id)| {
-                        id.as_object_id()
-                            .expect("MongoDB generates an ObjectId for inserted readings")
-                            .to_hex()
-                    })
-                    .collect::<Vec<_>>();
-                let counts = responses
-                    .iter()
-                    .map(|(_, count)| *count)
-                    .collect::<Vec<_>>();
-                let Some(request_ids) = split_inserted_ids(ids, &counts) else {
-                    eprintln!("MongoDB returned an unexpected number of inserted IDs");
-                    for (response, _) in responses {
-                        let _ = response.send(Err(()));
-                    }
-                    continue;
-                };
-
-                for ((response, _), ids) in responses.into_iter().zip(request_ids) {
-                    let _ = response.send(Ok(ids));
-                }
-            }
-            Err(error) => {
-                eprintln!("MongoDB grouped write failed: {error}");
-                for (response, _) in responses {
-                    let _ = response.send(Err(()));
-                }
-            }
-        }
-    }
-}
-
-struct CollectedWriteBatch {
-    documents: Vec<Document>,
-    responses: Vec<(oneshot::Sender<WriteResult>, usize)>,
-    overflow: Option<PendingWrite>,
-    queue_wait_total: Duration,
-    queue_wait_max: Duration,
-    collect_time: Duration,
-}
-
-async fn collect_write_batch(
-    receiver: &mut mpsc::Receiver<PendingWrite>,
-    first: PendingWrite,
-) -> CollectedWriteBatch {
-    let collect_started = Instant::now();
-    let first_queue_wait = collect_started.duration_since(first.enqueued_at);
-    let first_count = first.documents.len();
-    let mut documents = first.documents;
-    let mut responses = vec![(first.response, first_count)];
-    let mut overflow = None;
-    let mut queue_wait_total = first_queue_wait;
-    let mut queue_wait_max = first_queue_wait;
-    let deadline = Instant::now() + WRITE_BATCH_WINDOW;
-
-    while documents.len() < MAX_DOCUMENTS_PER_WRITE {
-        let next = tokio::select! {
-            request = receiver.recv() => request,
-            _ = sleep_until(deadline) => break,
-        };
-        let Some(next) = next else {
-            break;
-        };
-        let next_queue_wait = Instant::now().duration_since(next.enqueued_at);
-        let next_count = next.documents.len();
-        if documents.len() + next_count > MAX_DOCUMENTS_PER_WRITE {
-            overflow = Some(next);
-            break;
-        }
-
-        queue_wait_total += next_queue_wait;
-        queue_wait_max = queue_wait_max.max(next_queue_wait);
-        documents.extend(next.documents);
-        responses.push((next.response, next_count));
-    }
-
-    CollectedWriteBatch {
-        documents,
-        responses,
-        overflow,
-        queue_wait_total,
-        queue_wait_max,
-        collect_time: collect_started.elapsed(),
-    }
-}
-
-fn split_inserted_ids(ids: Vec<String>, counts: &[usize]) -> Option<Vec<Vec<String>>> {
-    if counts.iter().sum::<usize>() != ids.len() {
-        return None;
-    }
-
-    let mut offset = 0;
-    Some(
-        counts
-            .iter()
-            .map(|count| {
-                let end = offset + count;
-                let request_ids = ids[offset..end].to_vec();
-                offset = end;
-                request_ids
-            })
-            .collect(),
-    )
 }
 
 fn validate_device_id(device_id: &str) -> Result<&str, ApiError> {
@@ -575,8 +362,6 @@ fn optional_number(document: &Document, field: &str) -> Result<Option<f64>, ApiE
 enum ApiError {
     BadRequest(&'static str),
     Database(mongodb::error::Error),
-    BatchWriteFailed,
-    WriteQueueUnavailable,
     InvalidStoredData,
 }
 
@@ -590,17 +375,6 @@ impl IntoResponse for ApiError {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "database operation failed",
-                )
-            }
-            Self::BatchWriteFailed => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database operation failed",
-            ),
-            Self::WriteQueueUnavailable => {
-                eprintln!("MongoDB write queue is unavailable");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "database write queue is unavailable",
                 )
             }
             Self::InvalidStoredData => {
@@ -678,104 +452,5 @@ mod tests {
         assert_eq!(point.timestamp_ms, 1_795_548_600_000);
         assert_eq!(point.soil_ph, Some(6.5));
         assert_eq!(point.humidity_percent, None);
-    }
-
-    #[tokio::test]
-    async fn collects_separate_requests_into_one_write_batch() {
-        let (sender, mut receiver) = mpsc::channel(2);
-        let (first_response, _first_receiver) = oneshot::channel();
-        let (second_response, _second_receiver) = oneshot::channel();
-        assert!(
-            sender
-                .send(PendingWrite {
-                    documents: vec![doc! { "sequence": 1 }],
-                    response: first_response,
-                    enqueued_at: Instant::now(),
-                })
-                .await
-                .is_ok()
-        );
-        assert!(
-            sender
-                .send(PendingWrite {
-                    documents: vec![doc! { "sequence": 2 }],
-                    response: second_response,
-                    enqueued_at: Instant::now(),
-                })
-                .await
-                .is_ok()
-        );
-
-        let first = receiver.recv().await.unwrap();
-        let batch = collect_write_batch(&mut receiver, first).await;
-
-        assert_eq!(
-            batch.documents,
-            vec![doc! { "sequence": 1 }, doc! { "sequence": 2 }]
-        );
-        assert_eq!(
-            batch
-                .responses
-                .iter()
-                .map(|(_, count)| *count)
-                .collect::<Vec<_>>(),
-            vec![1, 1]
-        );
-        assert!(batch.overflow.is_none());
-    }
-
-    #[tokio::test]
-    async fn carries_a_request_forward_when_it_would_exceed_write_limit() {
-        let (sender, mut receiver) = mpsc::channel(2);
-        let (first_response, _first_receiver) = oneshot::channel();
-        let (second_response, _second_receiver) = oneshot::channel();
-        assert!(
-            sender
-                .send(PendingWrite {
-                    documents: vec![doc! { "sequence": 1 }; MAX_DOCUMENTS_PER_WRITE - 1],
-                    response: first_response,
-                    enqueued_at: Instant::now(),
-                })
-                .await
-                .is_ok()
-        );
-        assert!(
-            sender
-                .send(PendingWrite {
-                    documents: vec![doc! { "sequence": 2 }; 2],
-                    response: second_response,
-                    enqueued_at: Instant::now(),
-                })
-                .await
-                .is_ok()
-        );
-
-        let first = receiver.recv().await.unwrap();
-        let batch = collect_write_batch(&mut receiver, first).await;
-
-        assert_eq!(batch.documents.len(), MAX_DOCUMENTS_PER_WRITE - 1);
-        assert_eq!(batch.responses.len(), 1);
-        assert_eq!(
-            batch.overflow.map(|request| request.documents.len()),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn split_inserted_ids_preserves_each_request_boundary() {
-        let ids = vec!["id-1".to_owned(), "id-2".to_owned(), "id-3".to_owned()];
-
-        assert_eq!(
-            split_inserted_ids(ids, &[2, 1]),
-            Some(vec![
-                vec!["id-1".to_owned(), "id-2".to_owned()],
-                vec!["id-3".to_owned()],
-            ])
-        );
-    }
-
-    #[test]
-    fn split_inserted_ids_rejects_mismatched_counts() {
-        assert_eq!(split_inserted_ids(vec!["id-1".to_owned()], &[2]), None);
     }
 }
