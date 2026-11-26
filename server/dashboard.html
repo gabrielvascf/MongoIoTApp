@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Monitoramento do solo</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: system-ui, sans-serif;
+        color: #17212b;
+        background: #f3f6f8;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      main {
+        width: min(1100px, calc(100% - 32px));
+        margin: 32px auto;
+      }
+
+      h1 {
+        margin-bottom: 4px;
+      }
+
+      .intro,
+      #status {
+        color: #526170;
+      }
+
+      .controls,
+      .chart {
+        padding: 18px;
+        border: 1px solid #dce3e8;
+        border-radius: 10px;
+        background: white;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: end;
+        gap: 12px;
+        margin: 22px 0 12px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        font-size: 0.9rem;
+      }
+
+      select,
+      button {
+        min-height: 38px;
+        padding: 7px 10px;
+        border: 1px solid #b9c5ce;
+        border-radius: 6px;
+        background: white;
+        font: inherit;
+      }
+
+      button {
+        border-color: #176b58;
+        background: #176b58;
+        color: white;
+        cursor: pointer;
+      }
+
+      button:disabled,
+      select:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      #status {
+        min-height: 1.5em;
+      }
+
+      .charts {
+        display: grid;
+        gap: 16px;
+      }
+
+      .chart h2 {
+        margin: 0 0 10px;
+        font-size: 1.1rem;
+      }
+
+      svg {
+        display: block;
+        width: 100%;
+        height: auto;
+        overflow: visible;
+      }
+
+      @media (max-width: 600px) {
+        main {
+          width: min(100% - 20px, 1100px);
+          margin: 20px auto;
+        }
+
+        .controls {
+          align-items: stretch;
+        }
+
+        .controls label,
+        select,
+        button {
+          width: 100%;
+          box-sizing: border-box;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Monitoramento do solo</h1>
+      <p class="intro">Séries temporais das leituras enviadas pelos dispositivos.</p>
+
+      <section class="controls" aria-label="Filtros">
+        <button id="load-devices" type="button">Carregar dispositivos</button>
+        <label>
+          Dispositivo
+          <select id="device" disabled></select>
+        </label>
+        <label>
+          Período
+          <select id="period">
+            <option value="24">Últimas 24 horas</option>
+            <option value="168">Últimos 7 dias</option>
+            <option value="720">Últimos 30 dias</option>
+          </select>
+        </label>
+        <button id="refresh" type="button" disabled>Atualizar séries</button>
+      </section>
+
+      <p id="status" role="status" aria-live="polite">
+        Carregue os dispositivos para começar.
+      </p>
+
+      <section class="charts" aria-label="Séries temporais">
+        <article class="chart">
+          <h2>Humidade do solo (%)</h2>
+          <svg id="humidity-chart" viewBox="0 0 900 250" role="img" aria-label="Série temporal de humidade"></svg>
+        </article>
+        <article class="chart">
+          <h2>pH do solo</h2>
+          <svg id="ph-chart" viewBox="0 0 900 250" role="img" aria-label="Série temporal de pH"></svg>
+        </article>
+        <article class="chart">
+          <h2>Temperatura (°C)</h2>
+          <svg id="temperature-chart" viewBox="0 0 900 250" role="img" aria-label="Série temporal de temperatura"></svg>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      const deviceSelect = document.querySelector('#device');
+      const periodSelect = document.querySelector('#period');
+      const statusText = document.querySelector('#status');
+      const loadDevicesButton = document.querySelector('#load-devices');
+      const refreshButton = document.querySelector('#refresh');
+
+      async function getJson(url) {
+        const response = await fetch(url);
+        const body = await response.json();
+        if (!response.ok) {
+          throw new Error(body.error || `HTTP ${response.status}`);
+        }
+        return body;
+      }
+
+      function addSvgElement(svg, name, attributes = {}, text = '') {
+        const element = document.createElementNS('http://www.w3.org/2000/svg', name);
+        for (const [key, value] of Object.entries(attributes)) {
+          element.setAttribute(key, value);
+        }
+        if (text) {
+          element.textContent = text;
+        }
+        svg.append(element);
+        return element;
+      }
+
+      function renderChart(svgId, readings, field, color, fixedRange = null) {
+        const svg = document.querySelector(`#${svgId}`);
+        svg.replaceChildren();
+        const samples = readings.filter((reading) => Number.isFinite(reading[field]));
+        if (samples.length === 0) {
+          addSvgElement(
+            svg,
+            'text',
+            { x: 450, y: 125, 'text-anchor': 'middle', fill: '#647482' },
+            'Sem leituras desta variável no período selecionado',
+          );
+          return;
+        }
+
+        const plot = { left: 58, right: 880, top: 18, bottom: 202 };
+        let minValue = fixedRange ? fixedRange[0] : Math.min(...samples.map((sample) => sample[field]));
+        let maxValue = fixedRange ? fixedRange[1] : Math.max(...samples.map((sample) => sample[field]));
+        if (minValue === maxValue) {
+          const padding = Math.max(Math.abs(minValue) * 0.1, 1);
+          minValue -= padding;
+          maxValue += padding;
+        } else if (!fixedRange) {
+          const padding = (maxValue - minValue) * 0.1;
+          minValue -= padding;
+          maxValue += padding;
+        }
+
+        const firstTime = readings[0].timestamp_ms;
+        const lastTime = readings[readings.length - 1].timestamp_ms;
+        const x = (time) =>
+          plot.left + ((time - firstTime) / Math.max(lastTime - firstTime, 1)) * (plot.right - plot.left);
+        const y = (value) =>
+          plot.bottom - ((value - minValue) / (maxValue - minValue)) * (plot.bottom - plot.top);
+
+        for (let tick = 0; tick <= 4; tick += 1) {
+          const value = minValue + ((maxValue - minValue) * tick) / 4;
+          const yPosition = y(value);
+          addSvgElement(svg, 'line', {
+            x1: plot.left,
+            x2: plot.right,
+            y1: yPosition,
+            y2: yPosition,
+            stroke: '#e5eaee',
+          });
+          addSvgElement(
+            svg,
+            'text',
+            { x: plot.left - 8, y: yPosition + 4, 'text-anchor': 'end', fill: '#647482', 'font-size': 12 },
+            value.toFixed(1),
+          );
+        }
+
+        const points = samples.map((sample) => `${x(sample.timestamp_ms)},${y(sample[field])}`).join(' ');
+        addSvgElement(svg, 'polyline', {
+          points,
+          fill: 'none',
+          stroke: color,
+          'stroke-width': 2.5,
+          'stroke-linejoin': 'round',
+          'stroke-linecap': 'round',
+        });
+        if (samples.length === 1) {
+          addSvgElement(svg, 'circle', {
+            cx: x(samples[0].timestamp_ms),
+            cy: y(samples[0][field]),
+            r: 4,
+            fill: color,
+          });
+        }
+        addSvgElement(svg, 'line', {
+          x1: plot.left,
+          x2: plot.right,
+          y1: plot.bottom,
+          y2: plot.bottom,
+          stroke: '#9aa8b3',
+        });
+
+        const formatTime = (timestamp) =>
+          new Date(timestamp).toLocaleString('pt-BR', {
+            day: '2-digit',
+            month: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+        addSvgElement(
+          svg,
+          'text',
+          { x: plot.left, y: 232, fill: '#647482', 'font-size': 12 },
+          formatTime(firstTime),
+        );
+        addSvgElement(
+          svg,
+          'text',
+          { x: plot.right, y: 232, 'text-anchor': 'end', fill: '#647482', 'font-size': 12 },
+          formatTime(lastTime),
+        );
+      }
+
+      async function loadReadings() {
+        if (!deviceSelect.value) {
+          return;
+        }
+
+        statusText.textContent = 'Carregando leituras...';
+        const to = new Date();
+        const from = new Date(to.getTime() - Number(periodSelect.value) * 60 * 60 * 1000);
+        const query = new URLSearchParams({
+          device_id: deviceSelect.value,
+          from: from.toISOString(),
+          to: to.toISOString(),
+        });
+
+        try {
+          const result = await getJson(`/api/readings?${query}`);
+          const readings = result.readings;
+          renderChart('humidity-chart', readings, 'humidity_percent', '#16845b', [0, 100]);
+          renderChart('ph-chart', readings, 'soil_ph', '#7b55b4', [0, 14]);
+          renderChart('temperature-chart', readings, 'temperature_c', '#d36b24');
+          statusText.textContent = readings.length === 5000
+            ? 'Exibindo as 5.000 leituras mais recentes do período. Reduza o intervalo para ver mais detalhes.'
+            : `${readings.length} leituras encontradas no período.`;
+        } catch (error) {
+          statusText.textContent = `Não foi possível carregar as leituras: ${error.message}`;
+        }
+      }
+
+      loadDevicesButton.addEventListener('click', async () => {
+        statusText.textContent = 'Carregando dispositivos...';
+        loadDevicesButton.disabled = true;
+        try {
+          const devices = await getJson('/api/devices');
+          deviceSelect.replaceChildren();
+          for (const device of devices) {
+            const option = document.createElement('option');
+            option.value = device;
+            option.textContent = device;
+            deviceSelect.append(option);
+          }
+          deviceSelect.disabled = devices.length === 0;
+          refreshButton.disabled = devices.length === 0;
+          if (devices.length === 0) {
+            statusText.textContent = 'Nenhum dispositivo tem leituras armazenadas ainda.';
+          } else {
+            await loadReadings();
+          }
+        } catch (error) {
+          statusText.textContent = `Não foi possível carregar os dispositivos: ${error.message}`;
+        } finally {
+          loadDevicesButton.disabled = false;
+        }
+      });
+
+      refreshButton.addEventListener('click', loadReadings);
+      periodSelect.addEventListener('change', loadReadings);
+      deviceSelect.addEventListener('change', loadReadings);
+    </script>
+  </body>
+</html>
