@@ -4,7 +4,6 @@ WORKDIR /app
 
 COPY server/Cargo.toml server/Cargo.lock ./server/
 COPY server/src ./server/src
-COPY html/dashboard.html ./html/dashboard.html
 
 WORKDIR /app/server
 RUN cargo build --release
