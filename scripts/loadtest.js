@@ -6,6 +6,7 @@ const allowedBaseUrls = new Set([
   'http://localhost:7878',
   'http://127.0.0.1:7878',
   'http://host.docker.internal:7878',
+  'http://server:7878',
 ]);
 
 if (!allowedBaseUrls.has(BASE_URL)) {

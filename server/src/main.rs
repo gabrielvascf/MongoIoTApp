@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn dashboard() -> Html<&'static str> {
-    Html(include_str!("../dashboard.html"))
+    Html(include_str!("../../html/dashboard.html"))
 }
 
 async fn health(State(state): State<AppState>) -> Response {

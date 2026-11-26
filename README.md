@@ -1,6 +1,47 @@
-# Soil monitoring server
+# Soil monitoring app
 
 Servidor HTTP em Rust para receber leituras de humidade de solo e armazená-las no MongoDB.
+
+## Executar com Docker Compose
+
+Requisitos: Docker Engine e Docker Compose v2 (`docker compose`).
+
+Na raiz do repositório, construa e inicie o MongoDB, a API Rust e o frontend:
+
+```sh
+docker compose up --build -d
+```
+
+O Compose aguarda o MongoDB ficar saudável antes de iniciar o servidor, e o frontend aguarda a API. Acompanhe a inicialização com:
+
+```sh
+docker compose ps
+docker compose logs -f
+```
+
+Abra o painel em <http://localhost:8080>. O frontend encaminha as chamadas da API ao servidor. A API também fica disponível em <http://localhost:7878>, e seu endpoint de saúde em <http://localhost:7878/health>.
+
+Para executar o teste de carga k6 contra a API local do Compose:
+
+```sh
+docker compose --profile loadtest run --rm k6
+```
+
+O teste envia lotes ao servidor e pode inserir muitas leituras; execute-o apenas no ambiente local de desenvolvimento. O banco persiste no volume `mongo_data`, inclusive ao parar e recriar os containers.
+
+Para parar os serviços sem apagar os dados:
+
+```sh
+docker compose down
+```
+
+Para apagar também o banco e todas as leituras persistidas:
+
+```sh
+docker compose down --volumes
+```
+
+As portas do MongoDB, da API e do frontend estão vinculadas a `127.0.0.1` para não ficarem expostas a outras máquinas da rede.
 
 ## Requisitos
 
@@ -69,12 +110,12 @@ O envio unitário responde `201 Created` com o ID da leitura. Timestamps são ar
 
 ## Gerar dados de teste
 
-O script [seed.js](./seed.js) gera um mês de leituras por minuto para 100 dispositivos. Cada dispositivo recebe uma das sete combinações de sensores disponíveis, e os valores variam ao longo do dia e entre dispositivos. Isso cria **4.320.000 documentos**; reserve tempo e espaço em disco e execute em um banco de teste dedicado.
+O script [seed.js](./scripts/seed.js) gera um mês de leituras por minuto para 100 dispositivos. Cada dispositivo recebe uma das sete combinações de sensores disponíveis, e os valores variam ao longo do dia e entre dispositivos. Isso cria **4.320.000 documentos**; reserve tempo e espaço em disco e execute em um banco de teste dedicado.
 
 Na raiz do repositório, rode:
 
 ```sh
-mongosh "mongodb://localhost:27017/soil_monitoring_seed" --file server/seed.js
+mongosh "mongodb://localhost:27017/soil_monitoring_seed" --file scripts/seed.js
 ```
 
 Para visualizar esses dados no painel, inicie o servidor apontando para o mesmo banco:
@@ -88,14 +129,14 @@ O script não apaga dados anteriores; executá-lo novamente acrescenta outro con
 
 ## Teste de carga com k6
 
-O [loadtest.js](./loadtest.js) envia 60 leituras por requisição. Cada worker usa seu próprio `device_id` (`loadtest-1`, `loadtest-2`, etc.) e uma combinação de sensores que se repete a cada sete workers.
+O [loadtest.js](./scripts/loadtest.js) envia 60 leituras por requisição. Cada worker usa seu próprio `device_id` (`loadtest-1`, `loadtest-2`, etc.) e uma combinação de sensores que se repete a cada sete workers.
 
-Na pasta `server`, com o servidor rodando:
+Na raiz do repositório, com o servidor rodando:
 
 ```sh
 docker run --rm \
   --add-host=host.docker.internal:host-gateway \
-  -v "$PWD/loadtest.js:/scripts/loadtest.js:ro" \
+  -v "$PWD/scripts/loadtest.js:/scripts/loadtest.js:ro" \
   grafana/k6:master-with-browser run /scripts/loadtest.js
 ```
 
