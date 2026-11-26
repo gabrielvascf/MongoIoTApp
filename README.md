@@ -19,7 +19,7 @@ docker compose ps
 docker compose logs -f
 ```
 
-Abra o painel em <http://localhost:8080>. O frontend encaminha as chamadas da API ao servidor. A API também fica disponível em <http://localhost:7878>, e seu endpoint de saúde em <http://localhost:7878/health>.
+Abra o painel React em <http://localhost:8080>. O frontend encaminha as chamadas da API ao servidor. A API também fica disponível em <http://localhost:7878>, e seu endpoint de saúde em <http://localhost:7878/health>.
 
 Para executar o teste de carga k6 contra a API local do Compose:
 
@@ -28,6 +28,19 @@ docker compose --profile loadtest run --rm k6
 ```
 
 O teste envia lotes ao servidor e pode inserir muitas leituras; execute-o apenas no ambiente local de desenvolvimento. O banco persiste no volume `mongo_data`, inclusive ao parar e recriar os containers.
+
+### Teste gradual de capacidade
+
+O script [capacity-test.js](./scripts/capacity-test.js) começa com um dispositivo e aumenta gradualmente até o número configurado. Cada dispositivo envia continuamente lotes de 60 leituras com humidade, pH e temperatura, iniciando um novo lote assim que o anterior termina. Ao chegar ao alvo, mantém todos os dispositivos enviando por mais 10 segundos e então termina, se não houver erros. O teste exibe uma vez por segundo o número de dispositivos ativos e a latência observada; interrompe imediatamente se uma resposta ultrapassar 1 segundo ou se um lote falhar.
+
+O teste é restrito ao servidor local e não tem um teto fixo de dispositivos nem contabiliza o total de registros do banco. `MAX_DEVICES` define o alvo do ramp-up; ajuste esse valor conforme os recursos disponíveis:
+
+```sh
+MAX_DEVICES=1000 CAPACITY_RUN_ID=local-01 \
+  docker compose --profile capacity run --rm capacity-test
+```
+
+O banco pode acumular muitas leituras durante o teste; use um ambiente local de teste e monitore os recursos.
 
 Para parar os serviços sem apagar os dados:
 
@@ -70,11 +83,23 @@ Por padrão, o servidor escuta em `0.0.0.0:7878` para aceitar conexões de dispo
 
 Na inicialização, o servidor cria um índice por dispositivo e timestamp. O endpoint `GET /health` verifica a conexão com o MongoDB.
 
-## Painel de séries temporais
+## Frontend React
 
-Com o servidor em execução, abra `http://localhost:7878/` e clique em **Carregar dispositivos** para visualizar humidade, pH e temperatura nas últimas 24 horas, 7 dias ou 30 dias.
+O painel é uma aplicação React + TypeScript estilizada com Tailwind CSS. Para executá-la em modo de desenvolvimento, inicie primeiro o servidor e rode:
 
-As rotas `GET /api/devices` e `GET /api/readings` não exigem chave de API. A consulta de séries aceita `device_id`, `from` e `to` como parâmetros RFC 3339 e retorna até 5.000 pontos mais recentes no intervalo.
+```sh
+cd frontend
+pnpm install
+pnpm start
+```
+
+O servidor de desenvolvimento React abre em <http://localhost:3000> e encaminha as chamadas para a API em `http://localhost:7878`. O Docker Compose serve a versão de produção pelo Nginx.
+
+## Séries temporais
+
+Com os serviços em execução, abra `http://localhost:8080` para visualizar humidade, pH e temperatura nas últimas 24 horas, 7 dias ou 30 dias.
+
+As rotas `GET /api/devices` e `GET /api/readings` não exigem chave de API. A consulta de séries aceita `device_id`, `from` e `to` como parâmetros RFC 3339 e retorna até 43.200 pontos mais recentes no intervalo — um ponto por minuto durante 30 dias.
 
 ## Enviar uma leitura
 
@@ -104,13 +129,17 @@ curl -i http://localhost:7878/readings/batch \
   }'
 ```
 
-Uma leitura pode incluir `humidity_percent` (0 a 100), `soil_ph` (0 a 14) e `temperature_c` (graus Celsius). Cada item precisa incluir ao menos um desses campos e um timestamp RFC 3339 com fuso horário. Campos não enviados não são armazenados. A API grava um `_id` ObjectId gerado pelo MongoDB para cada documento e responde `201 Created` com a quantidade e os IDs inseridos na mesma ordem dos itens enviados. O limite padrão de corpo HTTP do Axum também limita o tamanho máximo de cada lote.
+Uma leitura pode incluir `humidity_percent` (0 a 100), `soil_ph` (0 a 14) e `temperature_c` (graus Celsius). Cada item precisa incluir ao menos um desses campos e um timestamp RFC 3339 com fuso horário. Campos não enviados não são armazenados. A API grava um `_id` ObjectId gerado pelo MongoDB para cada documento e responde `201 Created` com a quantidade e os IDs inseridos na mesma ordem dos itens enviados. Cada request para `/readings/batch` aceita até 3.000 leituras.
 
 O envio unitário responde `201 Created` com o ID da leitura. Timestamps são armazenados como BSON Date UTC. Dados inválidos recebem `400 Bad Request`. Como os IDs são gerados no servidor, reenviar um lote após perder a resposta pode criar duplicatas.
 
+As gravações concorrentes de `POST /readings` e `POST /readings/batch` são reunidas por até 10 ms e gravadas em um único comando MongoDB, com no máximo 3.000 documentos por comando. Cada request aguarda a confirmação da gravação e recebe somente os IDs dos seus próprios documentos.
+
+Durante a carga, o servidor emite linhas `[mongo-write]` com métricas agregadas em janelas de aproximadamente 1 segundo: `queue_wait_avg_ms`/`queue_wait_max_ms` medem o tempo do início do enfileiramento até o worker retirar cada request; `collect_avg_ms` mede o tempo de formação do lote; e `insert_many_avg_ms`/`insert_many_max_ms` medem a duração da chamada do driver MongoDB, incluindo a comunicação com o banco, não apenas o tempo registrado pelo profiler do MongoDB.
+
 ## Gerar dados de teste
 
-O script [seed.js](./scripts/seed.js) gera um mês de leituras por minuto para 100 dispositivos. Cada dispositivo recebe uma das sete combinações de sensores disponíveis, e os valores variam ao longo do dia e entre dispositivos. Isso cria **4.320.000 documentos**; reserve tempo e espaço em disco e execute em um banco de teste dedicado.
+O script [seed.js](./scripts/seed.js) gera 30 dias de leituras por minuto para cada um dos 100 dispositivos (**43.200 por dispositivo; 4.320.000 documentos**). Cada dispositivo recebe uma das sete combinações de sensores disponíveis, indicada no nome pelos sufixos `H` (humidade), `P` (pH) e `T` (temperatura), por exemplo `seed-device-001 (H-T)` ou `seed-device-002 (P-T)`. Humidade, pH e temperatura variam como senóides com período de 24 horas; a fase, a amplitude e o valor médio mudam entre dispositivos. Reserve tempo e espaço em disco e execute em um banco de teste dedicado.
 
 Na raiz do repositório, rode:
 
@@ -129,7 +158,7 @@ O script não apaga dados anteriores; executá-lo novamente acrescenta outro con
 
 ## Teste de carga com k6
 
-O [loadtest.js](./scripts/loadtest.js) envia 60 leituras por requisição. Cada worker usa seu próprio `device_id` (`loadtest-1`, `loadtest-2`, etc.) e uma combinação de sensores que se repete a cada sete workers.
+O [loadtest.js](./scripts/loadtest.js) envia 60 leituras por requisição, cobrindo uma hora por lote. Cada worker usa seu próprio `device_id` (`loadtest-1`, `loadtest-2`, etc.) e uma combinação de sensores que se repete a cada sete workers. Para os dados simulados do mês, use `seed.js`, que cria os 100 dispositivos `seed-device-*` com sufixos de sensor.
 
 Na raiz do repositório, com o servidor rodando:
 
