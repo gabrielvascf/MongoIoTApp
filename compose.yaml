@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
     environment:
       MONGODB_URI: mongodb://mongo:27017
-      MONGODB_DATABASE: soil_monitoring
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-soil_monitoring}
       SERVER_ADDR: 0.0.0.0:7878
     ports:
       - "127.0.0.1:7878:7878"
@@ -67,6 +67,20 @@ services:
     volumes:
       - ./scripts/capacity-test.js:/scripts/capacity-test.js:ro
     command: ["run", "/scripts/capacity-test.js"]
+    depends_on:
+      server:
+        condition: service_healthy
+
+  hourly-wave-test:
+    image: grafana/k6:0.54.0
+    profiles: ["hourly-wave"]
+    environment:
+      BASE_URL: http://server:7878
+      MAX_DEVICES: ${MAX_DEVICES:-25}
+      HOURLY_RUN_ID: ${HOURLY_RUN_ID:-local-01}
+    volumes:
+      - ./scripts/hourly-wave-test.js:/scripts/hourly-wave-test.js:ro
+    command: ["run", "/scripts/hourly-wave-test.js"]
     depends_on:
       server:
         condition: service_healthy
