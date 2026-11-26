@@ -16,6 +16,9 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use std::{env, net::SocketAddr};
+use tokio::net::TcpSocket;
+
+const LISTEN_BACKLOG: u32 = 4096;
 
 #[derive(Clone)]
 struct AppState {
@@ -124,7 +127,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/readings/batch", post(create_reading_batch))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    let listener = socket.listen(LISTEN_BACKLOG)?;
     println!("Server listening on {address}");
     axum::serve(listener, app).await?;
     Ok(())

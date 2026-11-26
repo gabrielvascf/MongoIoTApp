@@ -42,6 +42,10 @@ MAX_DEVICES=1000 CAPACITY_RUN_ID=local-01 \
 
 O banco pode acumular muitas leituras durante o teste; use um ambiente local de teste e monitore os recursos.
 
+### Teste de ondas horárias
+
+O script [hourly-wave-test.js](./scripts/hourly-wave-test.js) envia 60 leituras por dispositivo em cada onda. Dispara as requisições em paralelo, espera todas terminarem e então aguarda 1 segundo antes da próxima onda. O Compose configura até 65.536 file descriptors para o servidor e o k6; o listener Rust usa backlog de 4.096 conexões, limitado pelo `net.core.somaxconn` do ambiente. Execute com `MAX_DEVICES=1050 HOURLY_RUN_ID=local-01 docker compose --profile hourly-wave run --rm hourly-wave-test`.
+
 Para parar os serviços sem apagar os dados:
 
 ```sh
@@ -129,13 +133,11 @@ curl -i http://localhost:7878/readings/batch \
   }'
 ```
 
-Uma leitura pode incluir `humidity_percent` (0 a 100), `soil_ph` (0 a 14) e `temperature_c` (graus Celsius). Cada item precisa incluir ao menos um desses campos e um timestamp RFC 3339 com fuso horário. Campos não enviados não são armazenados. A API grava um `_id` ObjectId gerado pelo MongoDB para cada documento e responde `201 Created` com a quantidade e os IDs inseridos na mesma ordem dos itens enviados. Cada request para `/readings/batch` aceita até 3.000 leituras.
+Uma leitura pode incluir `humidity_percent` (0 a 100), `soil_ph` (0 a 14) e `temperature_c` (graus Celsius). Cada item precisa incluir ao menos um desses campos e um timestamp RFC 3339 com fuso horário. Campos não enviados não são armazenados. A API grava um `_id` ObjectId gerado pelo MongoDB para cada documento e responde `201 Created` com a quantidade e os IDs inseridos na mesma ordem dos itens enviados.
 
 O envio unitário responde `201 Created` com o ID da leitura. Timestamps são armazenados como BSON Date UTC. Dados inválidos recebem `400 Bad Request`. Como os IDs são gerados no servidor, reenviar um lote após perder a resposta pode criar duplicatas.
 
-As gravações concorrentes de `POST /readings` e `POST /readings/batch` são reunidas por até 10 ms e gravadas em um único comando MongoDB, com no máximo 3.000 documentos por comando. Cada request aguarda a confirmação da gravação e recebe somente os IDs dos seus próprios documentos.
-
-Durante a carga, o servidor emite linhas `[mongo-write]` com métricas agregadas em janelas de aproximadamente 1 segundo: `queue_wait_avg_ms`/`queue_wait_max_ms` medem o tempo do início do enfileiramento até o worker retirar cada request; `collect_avg_ms` mede o tempo de formação do lote; e `insert_many_avg_ms`/`insert_many_max_ms` medem a duração da chamada do driver MongoDB, incluindo a comunicação com o banco, não apenas o tempo registrado pelo profiler do MongoDB.
+Cada chamada de escrita valida os documentos e aguarda sua própria operação `insert_one` ou `insert_many` no MongoDB antes de responder.
 
 ## Gerar dados de teste
 
