@@ -18,6 +18,10 @@ services:
       context: .
       dockerfile: server/Dockerfile
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       MONGODB_URI: mongodb://mongo:27017
       MONGODB_DATABASE: ${MONGODB_DATABASE:-soil_monitoring}

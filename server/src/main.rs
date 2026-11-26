@@ -18,14 +18,15 @@ use mongodb::{
 use serde::{Deserialize, Serialize};
 use std::{env, net::SocketAddr, time::Duration};
 use tokio::{
-    sync::{mpsc, oneshot},
-    time::{Instant, sleep_until},
+    net::TcpSocket, sync::{mpsc, oneshot}, time::{Instant, sleep_until},
 };
+
+const LISTEN_BACKLOG: u32 = 4096;
 
 const MAX_READINGS_PER_DEVICE: i64 = 30 * 24 * 60;
 const MAX_READINGS_PER_REQUEST: usize = 6000;
 const WRITE_BATCH_WINDOW: Duration = Duration::from_millis(10);
-const MAX_DOCUMENTS_PER_WRITE: usize = 500;
+const MAX_DOCUMENTS_PER_WRITE: usize = 1000;
 const WRITE_QUEUE_CAPACITY: usize = 128;
 const READINGS_COLLECTION: &str = "readings_ts";
 
@@ -145,7 +146,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/readings/batch", post(create_reading_batch))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    let listener = socket.listen(LISTEN_BACKLOG)?;
     println!("Server listening on {address}");
     axum::serve(listener, app).await?;
     Ok(())
